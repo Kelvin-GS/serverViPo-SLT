@@ -1,0 +1,64 @@
+# Python environments and caches
+vipo/
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Local experiment outputs
+work_dir/
+outputs/
+runs/
+checkpoints/
+wandb/
+.cache/
+build/
+dist/
+*.egg-info/
+*.log
+log.txt
+*.out
+*.err
+
+# Downloaded datasets and generated dataset metadata
+Ahhh/
+preprocess/CSL-Daily/
+preprocess/phoenix2014-T/
+*.npy
+*.npz
+*.stm
+split_*.txt
+video_map.txt
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.pkl
+*.pickle
+*.h5
+*.onnx
+*.joblib
+*.parquet
+*.feather
+
+# Video, archive, and other generated binary files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# Accidental package-install output
+=6.31.1

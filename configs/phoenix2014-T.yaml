@@ -1,0 +1,33 @@
+# dataset_root: /Users/gufran/Developer/data/phoenix2014T
+
+dataset_root: /home/jupyter-gkelvin/Ahhh/data/PHOENIX-2014-T-release-v3/PHOENIX-2014-T
+
+dict_path: ./preprocess/phoenix2014-T/gloss_dict.npy
+# feature_dir: /home/ahmedubc/projects/aip-lsigal/ahmedubc/datasets/phoenix2014T/fullFrame-256x256px
+
+feature_dir: /home/jupyter-gkelvin/Ahhh/data/PHOENIX-2014-T-release-v3/PHOENIX-2014-T/features/fullFrame-210x260px
+
+# sp_path: /home/ahmedubc/projects/aip-lsigal/ahmedubc/datasets/spamo/sp/clip-vit-large-patch14_feat_Phoenix14T
+# sp_path: /home/ahmedubc/projects/aip-lsigal/ahmedubc/datasets/dino_sp/sp/dinov2-giant-imagenet1k-1-layer_feat_phoenix2014-T
+
+# sp_path: /home/ahmedubc/projects/aip-lsigal/ahmedubc/datasets/phoenix2014T/features2
+
+sp_path: /home/jupyter-gkelvin/Ahhh/data/feats/clip-vit-large-patch14_feat_phoenix2014-T
+
+# mo_path: /home/ahmedubc/projects/aip-lsigal/ahmedubc/datasets/spamo/mo/mae_feat_Phoenix14T
+
+# mo_path: /home/ahmedubc/projects/aip-lsigal/ahmedubc/datasets/phoenix2014T/openpose
+
+mo_path: /home/jupyter-gkelvin/Ahhh/data/feats/mae_feat_phoenix2014-T
+
+# phm_path: /home/ahmedubc/projects/aip-lsigal/ahmedubc/datasets/spamo/posp/clip-vit-large-patch14_feat_Phoenix14T
+
+phm_path: /home/jupyter-gkelvin/Ahhh/data/feats/clip-vit-large-patch14_feat_phoenix2014-T
+
+pose_path: /home/ahmedubc/projects/aip-lsigal/ahmedubc/datasets/pose
+
+# pose_encoder_config_path: /home/ahmedubc/projects/aip-lsigal/ahmedubc/MM_SLT/configs/phoenix-2014t_s2g.yaml
+
+pose_encoder_config_path: /home/jupyter-gkelvin/Ahhh/ViPo-SLT/configs/phoenix-2014t_s2g.yaml
+
+language: German

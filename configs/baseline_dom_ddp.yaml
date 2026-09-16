@@ -1,0 +1,103 @@
+# inits ================================================================================================================================================================================================================== 
+random_seed: 0
+work_dir: /data/ahmed026/MM_SLT/test
+# inits ==================================================================================================================================================================================================================
+
+
+
+# idk ==================================================================================================================================================================================================================
+batch_size: 8
+accumulate_grad_batches: 2
+test_batch_size: 2
+
+num_worker: 0
+device: cuda:0
+
+feeder: dataset.loader_img.BaseFeeder
+feeder_ft: dataset.loader_ft.PrecomputedFeatureDataset
+
+dataset: phoenix2014-T
+# idk ==================================================================================================================================================================================================================
+
+
+
+# modalities ==================================================================================================================================================================================================================
+include_sp: True
+include_pose: False
+include_mo: False
+include_sign: False
+p2hm: False
+
+# sp_hidden_size: 768 #ViViT
+# sp_hidden_size: 2048 #ViT
+sp_hidden_size: 3072 #DinoV2
+
+pose_hidden_size: 1024 #KP
+# pose_hidden_size: 2048 #HM
+
+mo_hidden_size: 1024
+
+sign_hidden_size: 1024
+# modalities ==================================================================================================================================================================================================================
+
+
+
+# train params ==================================================================================================================================================================================================================
+phase: train
+num_epoch: 1000
+num_warmup_epochs: 100
+epochs_before_lr_decay: 10
+scheduler_patience: 5
+validation_interval: 5
+patience: 10
+monitor_bleu: True
+score_dependent_scheduler: True
+contrastive: True
+include_ctc: True
+
+optimizer_args:
+  optimizer: Adam
+  base_lr: 0.0001
+  learning_ratio: 1
+  gamma: 0.2
+  weight_decay: 0.0001
+  start_epoch: 0
+
+feeder_args:
+  mode: 'train'
+  datatype: 'video'
+  num_gloss: -1
+  drop_ratio: 1.0
+  frame_interval: 1
+  image_scale: 1.0
+  input_size: 224
+# train params ==================================================================================================================================================================================================================
+
+
+
+
+# model params ==================================================================================================================================================================================================================
+slr: modules.slr.SLRModel
+slr_weights: /Users/gufran/Developer/Projects/AI/MLLM_SLT/ckpt/swinB_SLR.pt
+
+model: llms.dom_ddp.DecoderOnlyModel
+llm: meta-llama/Llama-2-7b-hf
+# llm: meta-llama/Llama-2-13b-hf
+# llm: meta-llama/Llama-3.2-3B
+
+slr_args:
+  c2d_type: swinb_mstcn-3
+  conv_type: 2
+  use_bn: 1
+  share_classifier: 1
+  weight_norm: True
+
+llm_args:
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.1
+  max_txt_len: 64
+  llm_hidden_size: 768
+  tuning_mode: lora
+  prompt: "Translate the given sentence into:"
+# model params ==================================================================================================================================================================================================================

@@ -1,0 +1,17 @@
+dataset_root: /Users/gufran/Developer/data/csldaily
+dict_path: ./preprocess/CSL-Daily/gloss_dict.npy
+feature_dir: /home/ahmedubc/projects/aip-lsigal/ahmedubc/datasets/csldaily/features
+
+# sp_path: /home/ahmedubc/projects/aip-lsigal/ahmedubc/datasets/spamo/sp/clip-vit-large-patch14_feat_Phoenix14T
+# sp_path: /home/ahmedubc/projects/aip-lsigal/ahmedubc/datasets/dino_sp/sp/dinov2-giant-imagenet1k-1-layer_feat_phoenix2014-T
+sp_path: /home/ahmedubc/projects/aip-lsigal/ahmedubc/datasets/csldaily/features
+
+# mo_path: /home/ahmedubc/projects/aip-lsigal/ahmedubc/datasets/spamo/mo/mae_feat_Phoenix14T
+mo_path: /home/ahmedubc/projects/aip-lsigal/ahmedubc/datasets/csldaily/openpose
+
+phm_path: /home/ahmedubc/projects/aip-lsigal/ahmedubc/datasets/spamo/posp/clip-vit-large-patch14_feat_Phoenix14T
+pose_path: /home/ahmedubc/projects/aip-lsigal/ahmedubc/datasets/pose
+
+pose_encoder_config_path: /home/ahmedubc/projects/aip-lsigal/ahmedubc/MM_SLT/configs/csl-daily_s2g.yaml
+
+language: Chinese
