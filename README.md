@@ -22,10 +22,16 @@ Follow these steps to set up the environment and get started:
 1. **Clone the repository**:
 
    ```bash
+   git clone https://github.com/Kelvin-GS/serverViPo-SLT.git
+   ```
+
+2. **The Repo was forked from**:
+
+   ```bash
    git clone https://github.com/gufranSabri/ViPo-SLT.git
    ```
 
-2. **Set up the Python environment**:
+3. **Set up the Python environment**:
    - Install `virtualenv`:
 
      ```bash
