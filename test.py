@@ -144,7 +144,7 @@ def main(arg, WORK_DIR_PATH):
     model.eval()
 
     for i, batch in enumerate(tqdm(test_loader)):
-        sp_features, pose_features, rp_features, glosses, texts, icl_text, sp_lengths, pose_lengths, rp_lengths = batch
+        sp_features, pose_features, rp_features, glosses, texts, english_texts, sp_lengths, pose_lengths, rp_lengths = batch
 
         sp_features = sp_features.to("cuda") if sp_features is not None else None
         if arg.include_pose:
@@ -159,7 +159,7 @@ def main(arg, WORK_DIR_PATH):
             gen_str, ref_str = model(
                 sp_features, pose_features, rp_features,
                 sp_lengths, pose_lengths, rp_lengths,
-                glosses, texts, icl_text, warmup=warmup
+                glosses, texts, english_texts, warmup=warmup
             )
         gen_strings.extend(gen_str)
         ref_strings.extend(ref_str)

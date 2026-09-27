@@ -45,7 +45,11 @@ class PrecomputedFeatureDataset(Dataset):
         self.anno_path = f"./preprocess/{dataset}/{mode}_info_ml.npy"
         self.prep_annots(np.load(self.anno_path, allow_pickle=True).item())
 
-        self._pose_init(os.path.join(self.pose_dir, f"{dataset}.{mode}"), mode)
+        # Pose features are only loaded when this modality is actually used.
+        # Loading them unconditionally crashes when pose_path is absent even
+        # though include_pose is False.
+        if self.include_pose:
+            self._pose_init(os.path.join(self.pose_dir, f"{dataset}.{mode}"), mode)
 
 
     def _pose_init(self, path, phase):
@@ -112,21 +116,18 @@ class PrecomputedFeatureDataset(Dataset):
         pose_ft = self.pose_dict[f"{self.mode}/{self.files[idx].replace('.pkl', '')}"]["keypoint"].permute(2, 0, 1).to(torch.float32) if self.include_pose else None
         mo_ft = torch.tensor(np.load(mo_ft_path), dtype=torch.float32) if self.include_mo else None
 
-        gloss = self.gloss[self.files[idx].replace(".pkl", "")]
-        text = self.text[self.files[idx].replace(".pkl", "")]
+        fileid = self.files[idx].replace(".pkl", "")
+        gloss = self.gloss[fileid]
+        text = self.text[fileid]
 
-        # icl_text = "\n".join([
-        #     f'{self.translations[self.files[idx].replace(".pkl", "")]["en"]}={text}',
-        #     f'{self.translations[self.files[idx].replace(".pkl", "")]["fr"]}={text}',
-        #     f'{self.translations[self.files[idx].replace(".pkl", "")]["es"]}={text}',
-        # ])
-        icl_text = "\n".join([
-            f'{self.translations[self.files[idx].replace(".pkl", "")]["fr"]}={text}',
-            f'{self.translations[self.files[idx].replace(".pkl", "")]["es"]}={text}',
-            f'{self.translations[self.files[idx].replace(".pkl", "")]["en"]}={text}',
-        ])
+        # Only the English translation is returned here, and it is used solely
+        # as the target of the contrastive objective. It is never placed into
+        # the LLM input. The target sentence (`text`) must never be exposed to
+        # the model, otherwise the answer leaks into the encoder prompt.
+        translations = self.translations.get(fileid, {})
+        english_text = translations.get("en") or text
 
-        return sp_ft, pose_ft, mo_ft, gloss, text, icl_text
+        return sp_ft, pose_ft, mo_ft, gloss, text, english_text
 
     def rotate_points(self, points, angle):
         center = [0, 0]
@@ -238,7 +239,7 @@ class PrecomputedFeatureDataset(Dataset):
 
     
     def collate_fn(self, batch):
-        sp_ft, pose_ft, mo_ft, glosses, texts, icl_text = zip(*batch)  # unpack the batch
+        sp_ft, pose_ft, mo_ft, glosses, texts, english_texts = zip(*batch)  # unpack the batch
 
         pose_prepped = self.pose_collate([(p, p.shape[1]) for p in pose_ft if p is not None]) if pose_ft[0] is not None else None
 
@@ -249,7 +250,7 @@ class PrecomputedFeatureDataset(Dataset):
         padded_sp_ft = pad_sequence(sp_ft, batch_first=True) if sp_ft[0] is not None else None
         padded_mo_ft = pad_sequence(mo_ft, batch_first=True) if mo_ft[0] is not None else None
 
-        return padded_sp_ft, pose_prepped, padded_mo_ft, glosses, texts, icl_text, sp_lengths, pose_lengths, mo_lengths
+        return padded_sp_ft, pose_prepped, padded_mo_ft, glosses, texts, english_texts, sp_lengths, pose_lengths, mo_lengths
 
 
 if __name__ == "__main__":
@@ -266,13 +267,13 @@ if __name__ == "__main__":
     )
     dataloader = DataLoader(dataset, batch_size=2, shuffle=True, collate_fn=dataset.collate_fn)
 
-    for sp_features, pose_features, mo_features, glosses, texts, icl_text, sp_lengths, pose_lengths, mo_lengths in dataloader:
+    for sp_features, pose_features, mo_features, glosses, texts, english_texts, sp_lengths, pose_lengths, mo_lengths in dataloader:
         print(sp_features.shape)
         print(pose_features["keypoint"].shape)
         print(mo_features.shape)
         print(glosses)
         print(texts)
-        print(icl_text[0])
+        print(english_texts[0])
         print(sp_lengths)
         print(pose_lengths)
         print(mo_lengths)

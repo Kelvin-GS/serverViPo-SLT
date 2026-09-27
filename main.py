@@ -116,7 +116,7 @@ def setup_data(arg, world_size, rank, is_main):
         sampler[mode] = DistributedSampler(dataset) if train_flag else None
 
         batch_size = arg.batch_size 
-        batch_size = (batch_size // world_size) if mode == "train" else arg.test_batch_size
+        batch_size = max(1, batch_size // world_size) if mode == "train" else arg.test_batch_size
         data_loader[mode] = torch.utils.data.DataLoader(
             dataset,
             batch_size=batch_size,
@@ -212,7 +212,7 @@ def main(rank, world_size, arg, WORK_DIR_PATH):
         model.train()
         # for i, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}/{arg.num_epoch + arg.num_warmup_epochs}", ncols=100)):
         for i, batch in enumerate(train_loader):
-            sp_features, pose_features, mo_features, glosses, texts, icl_text, sp_lengths, pose_lengths, mo_lengths = batch
+            sp_features, pose_features, mo_features, glosses, texts, english_texts, sp_lengths, pose_lengths, mo_lengths = batch
 
             sp_features = sp_features.to(rank) if sp_features is not None else None
             if arg.include_pose:
@@ -226,7 +226,7 @@ def main(rank, world_size, arg, WORK_DIR_PATH):
             loss = model(
                 sp_features, pose_features, mo_features,
                 sp_lengths, pose_lengths, mo_lengths,
-                glosses, texts, icl_text, warmup=warmup
+                glosses, texts, english_texts, warmup=warmup
             )
 
             loss = loss / arg.accumulate_grad_batches
@@ -251,7 +251,7 @@ def main(rank, world_size, arg, WORK_DIR_PATH):
             model.eval()
             # for i, batch in enumerate(tqdm(val_loader, desc="Validation", ncols=100)):
             for i, batch in enumerate(val_loader):
-                sp_features, pose_features, mo_features, glosses, texts, icl_text, sp_lengths, pose_lengths, mo_lengths = batch
+                sp_features, pose_features, mo_features, glosses, texts, english_texts, sp_lengths, pose_lengths, mo_lengths = batch
 
                 sp_features = sp_features.to(rank) if sp_features is not None else None
                 if arg.include_pose:
@@ -266,7 +266,7 @@ def main(rank, world_size, arg, WORK_DIR_PATH):
                     gen_str, ref_str = model(
                         sp_features, pose_features, mo_features,
                         sp_lengths, pose_lengths, mo_lengths,
-                        glosses, texts, icl_text, warmup=warmup
+                        glosses, texts, english_texts, warmup=warmup
                     )
                 gen_strings.extend(gen_str)
                 ref_strings.extend(ref_str)
@@ -318,6 +318,42 @@ def main(rank, world_size, arg, WORK_DIR_PATH):
         elapsed_time_mins = (time.time() - start_time) / 60
         if is_main: main_logger(f"Elapsed Time: {elapsed_time_mins:.2f} mins")
         if is_main: main_logger("\n")
+
+    # Final evaluation on the held-out test split ==============================
+    if is_main:
+        main_logger("=" * 20 + " TESTING " + "=" * 20)
+    model.eval()
+    gen_strings, ref_strings = [], []
+    for i, batch in enumerate(test_loader):
+        sp_features, pose_features, mo_features, glosses, texts, english_texts, sp_lengths, pose_lengths, mo_lengths = batch
+
+        sp_features = sp_features.to(rank) if sp_features is not None else None
+        if arg.include_pose:
+            pose_features["keypoint"] = pose_features["keypoint"].to(rank) if pose_features is not None else None
+            pose_features["mask"] = pose_features["mask"].to(rank) if pose_features is not None else None
+        mo_features = mo_features.to(rank) if mo_features is not None else None
+        sp_lengths = sp_lengths.to(rank) if sp_lengths is not None else None
+        pose_lengths = pose_lengths.to(rank) if pose_lengths is not None else None
+        mo_lengths = mo_lengths.to(rank) if mo_lengths is not None else None
+
+        with torch.no_grad():
+            gen_str, ref_str = model(
+                sp_features, pose_features, mo_features,
+                sp_lengths, pose_lengths, mo_lengths,
+                glosses, texts, english_texts, warmup=False
+            )
+        gen_strings.extend(gen_str)
+        ref_strings.extend(ref_str)
+
+    if is_main:
+        pred_logger("=" * 10 + "TEST - Generated and Reference Strings" + "=" * 10)
+        for i in range(min(5, len(gen_strings))):
+            pred_logger(f"Generated: {gen_strings[i]}")
+            pred_logger(f"Reference: {ref_strings[i]}")
+            pred_logger("-" * 50)
+        pred_logger("\n")
+        scores = evaluate_results(gen_strings, ref_strings)
+        main_logger(f"Test Scores > B1: {scores['BLEU-1']:.4f}, B2: {scores['BLEU-2']:.4f}, B3: {scores['BLEU-3']:.4f}, B4: {scores['BLEU-4']:.4f}, RG-L: {scores['ROUGE-L_F1']:.4f}")
 
     cleanup()
 
