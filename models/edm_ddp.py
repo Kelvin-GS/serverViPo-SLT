@@ -1,4 +1,3 @@
-import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,7 +5,7 @@ from modules.tconv import TemporalConv
 from modules.ff import IMTM_CMTM
 from modules.pose_encoder.model import PoseEncoder
 from torch.distributed.nn.functional import all_gather
-from utils.helpers import safe_derangement, clip_loss
+from utils.helpers import clip_loss
 
 from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoTokenizer, T5ForConditionalGeneration, T5Config
@@ -42,6 +41,9 @@ class EDM(nn.Module):
         self.include_ctc = arg["include_ctc"]
         self.llm_name = arg["llm"]
         self.dataset = arg["dataset"]
+        self.llm_precision = arg.get("llm_precision", "fp32")
+        self.gradient_checkpointing = arg.get("gradient_checkpointing", False)
+        self.ctc_weight = arg.get("ctc_weight", 1.0)
         self.bart_lang_heads = {"CSL-Daily": "zh_CN", "phoenix2014-T": "de_DE"}
 
         self.gloss_dict = {k:v[0] for k,v in self.gloss_dict.items()}
@@ -50,15 +52,26 @@ class EDM(nn.Module):
         if arg["apply_lora"]:
             self._apply_lora()
 
+        if self.gradient_checkpointing and hasattr(self.llm, "enable_input_require_grads"):
+            self.llm.enable_input_require_grads()
+
         print("PROMPT:", self.prompt)
 
         total_params = sum(p.numel() for p in self.parameters())
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         print(f"Total parameters: {total_params / 1_000_000:.2f}M, Trainable parameters: {trainable_params / 1_000_000:.2f}M")
 
+    def _resolve_llm_dtype(self):
+        if self.llm_precision == "bf16":
+            return torch.bfloat16
+        if self.llm_precision == "fp16":
+            return torch.float16
+        return torch.float32
+
     def _prepare_llm(self, model: str) -> None:
+        llm_dtype = self._resolve_llm_dtype()
         if "bart" in model.lower():
-            self.llm = MBartForConditionalGeneration.from_pretrained(model)
+            self.llm = MBartForConditionalGeneration.from_pretrained(model, torch_dtype=llm_dtype)
             self.tokenizer = MBart50TokenizerFast.from_pretrained(
                 model, 
                 cache_dir="./data/models",
@@ -70,12 +83,21 @@ class EDM(nn.Module):
             config = T5Config.from_pretrained(model, cache_dir="./data/models")
             config.output_hidden_states = True   # ensures encoder hidden states
             config.return_dict = True
-            self.llm = T5ForConditionalGeneration.from_pretrained(model, config=config)
+            self.llm = T5ForConditionalGeneration.from_pretrained(model, config=config, torch_dtype=llm_dtype)
             self.tokenizer = AutoTokenizer.from_pretrained(
                 model, 
                 cache_dir="./data/models",
                 max_length=self.max_txt_len,
             )
+
+        if self.gradient_checkpointing:
+            try:
+                self.llm.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
+            except TypeError:
+                self.llm.gradient_checkpointing_enable()
+            self.llm.config.use_cache = False
 
         self.sp_proj = nn.Linear(self.sp_hidden_size, self.hidden_size) if self.include_sp else None
         self.pose_proj = nn.Linear(self.pose_hidden_size, self.hidden_size) if self.include_pose else None
@@ -128,7 +150,7 @@ class EDM(nn.Module):
                 nn.Linear(self.hidden_size, self.hidden_size),
             ) if self.include_pose else None
 
-            self.ctc_loss = torch.nn.CTCLoss(reduction='none', zero_infinity=False)
+            self.ctc_loss = torch.nn.CTCLoss(reduction='none', zero_infinity=True)
 
     def freeze_all_parameters(self):
         for param in self.llm.parameters():
@@ -195,8 +217,8 @@ class EDM(nn.Module):
         return self.ctc_loss(
             logits.permute(1,0,2).contiguous().log_softmax(-1),
             gloss_labels,
-            ft_lgt,
-            label_lgt
+            ft_lgt.reshape(-1).cpu().long(),
+            label_lgt.reshape(-1).cpu().long(),
         ).mean()
 
 
@@ -220,21 +242,31 @@ class EDM(nn.Module):
             logits_mo = self.clf_mo(mo_features) if self.include_mo else None
             logits_pose = self.clf_pose(pose_features) if self.include_pose else None
 
-            if self.include_ctc:
-                glosses = [gloss.split(" ") for gloss in glosses]
-                gloss_labels = []
-                label_lengths = []
-                for gloss in glosses:
-                    label = [self.gloss_dict[g] for g in gloss]
-                    gloss_labels.extend(label)
-                    label_lengths.append(len(label))
+            device = (sp_features if self.include_sp else mo_features if self.include_mo else pose_features).device
+            gloss_labels, label_lengths, valid_idx = [], [], []
+            for i, gloss in enumerate(glosses):
+                label = [self.gloss_dict[g] for g in gloss.split(" ") if g in self.gloss_dict]
+                if len(label) == 0:
+                    continue  # CTC is undefined without a valid non-empty target
+                gloss_labels.extend(label)
+                label_lengths.append(len(label))
+                valid_idx.append(i)
 
-                gloss_labels = torch.LongTensor(gloss_labels)
-                label_lengths = torch.LongTensor(label_lengths)
+            if len(valid_idx) > 0:
+                vi = torch.tensor(valid_idx, dtype=torch.long, device=device)
+                gloss_labels = torch.tensor(gloss_labels, dtype=torch.long, device=device)
+                label_lengths = torch.tensor(label_lengths, dtype=torch.long, device=device)
 
-                slr_loss += self.calc_ctc_loss(logits_sp, gloss_labels, sp_lengths, label_lengths) if logits_sp is not None else 0
-                slr_loss += self.calc_ctc_loss(logits_mo, gloss_labels, mo_lengths, label_lengths) if logits_mo is not None else 0
-                slr_loss += self.calc_ctc_loss(logits_pose, gloss_labels, pose_lengths, label_lengths) if logits_pose is not None else 0
+                if logits_sp is not None:
+                    slr_loss = slr_loss + self.calc_ctc_loss(logits_sp[vi], gloss_labels, sp_lengths[vi], label_lengths)
+                if logits_mo is not None:
+                    slr_loss = slr_loss + self.calc_ctc_loss(logits_mo[vi], gloss_labels, mo_lengths[vi], label_lengths)
+                if logits_pose is not None:
+                    slr_loss = slr_loss + self.calc_ctc_loss(logits_pose[vi], gloss_labels, pose_lengths[vi], label_lengths)
+            elif not getattr(self, "_ctc_warned", False):
+                self._ctc_warned = True
+                print("[ctc] WARNING: no valid gloss targets in batch; CTC loss is 0. "
+                      "Check that gloss tokens match gloss_dict keys.")
 
             mlp_sp = self.pre_llm_sp(logits_sp) if self.include_sp else None
             mlp_mo = self.pre_llm_mo(logits_mo) if self.include_mo else None
@@ -296,8 +328,8 @@ class EDM(nn.Module):
 
         joint_embeds, visual_embeds, new_lengths = [], [], []
         for i in range(bs):
-            vis = visual_tokens[i, :visual_lengths[i], :]
             prm = prompt_embeds[i, :prompt_lengths[i], :]
+            vis = visual_tokens[i, :visual_lengths[i], :].to(prm.dtype)
 
             if "bart" in self.llm_name.lower():
                 combined = torch.cat([vis], dim=0)
@@ -322,17 +354,14 @@ class EDM(nn.Module):
         self, 
         sp_features, pose_features, mo_features, 
         sp_lengths, pose_lengths, mo_lengths,
-        glosses, texts, icl_text, warmup=False
+        glosses, texts, english_texts, warmup=False
     ):
         bs = sp_features.shape[0] if self.include_sp else mo_features.shape[0]
 
-        # english_texts = [icl_text[i].split('=')[0] for i in range(bs)]
-        english_texts = [icl_text[i].split('=')[-2].split("\n")[1] for i in range(bs)]
-        icl_text = safe_derangement(icl_text)
-        prompts = [
-            f"{self.prompt}\n\nExamples:\n{icl_text[i]}" 
-            for i in range(bs)
-        ]
+        # Instruction-only prompt. The target sentence (and any other sample's
+        # target) must never be embedded into the encoder input, otherwise the
+        # model can simply copy the answer instead of translating the signs.
+        prompts = [self.prompt for _ in range(bs)]
 
         visual_tokens, visual_lengths, slr_loss = self._prepare_visual_input(
             sp_features, pose_features, mo_features,
@@ -391,7 +420,7 @@ class EDM(nn.Module):
                 )
                 loss += outputs.loss
             
-            return loss + slr_loss
+            return loss + self.ctc_weight * slr_loss
 
         else:
             generated = self.llm.generate(

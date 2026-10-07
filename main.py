@@ -77,6 +77,9 @@ def setup_work_dir(arg, is_main, WORK_DIR_PATH):
     arg.llm_args["mo_hidden_size"] = arg.mo_hidden_size
     arg.llm_args["contrastive"] = arg.contrastive
     arg.llm_args["include_ctc"] = arg.include_ctc
+    arg.llm_args["llm_precision"] = getattr(arg, "llm_precision", "fp32")
+    arg.llm_args["gradient_checkpointing"] = getattr(arg, "gradient_checkpointing", False)
+    arg.llm_args["ctc_weight"] = getattr(arg, "ctc_weight", 1.0)
     arg.llm_args["gloss_dict"] = np.load(arg.dataset_info['dict_path'], allow_pickle=True).item()
     arg.llm_args["dataset"] = arg.dataset
     arg.llm_args["num_heads"] = arg.temporal_args["num_heads"]
@@ -322,6 +325,13 @@ def main(rank, world_size, arg, WORK_DIR_PATH):
     # Final evaluation on the held-out test split ==============================
     if is_main:
         main_logger("=" * 20 + " TESTING " + "=" * 20)
+    best_path = WORK_DIR_PATH + '/best_model.pt'
+    if os.path.exists(best_path):
+        if is_main: main_logger("Loading best_model.pt for final test evaluation.")
+        best_state = torch.load(best_path, map_location="cpu")
+        model.load_state_dict(best_state)
+        del best_state
+        torch.cuda.empty_cache()
     model.eval()
     gen_strings, ref_strings = [], []
     for i, batch in enumerate(test_loader):

@@ -56,6 +56,8 @@ def setup_work_dir(arg, WORK_DIR_PATH):
     arg.llm_args["mo_hidden_size"] = arg.mo_hidden_size
     arg.llm_args["contrastive"] = arg.contrastive
     arg.llm_args["include_ctc"] = arg.include_ctc
+    arg.llm_args["llm_precision"] = getattr(arg, "llm_precision", "fp32")
+    arg.llm_args["gradient_checkpointing"] = getattr(arg, "gradient_checkpointing", False)
     arg.llm_args["dataset"] = arg.dataset
     arg.llm_args["gloss_dict"] = np.load(arg.dataset_info['dict_path'], allow_pickle=True).item()
     arg.llm_args["num_heads"] = arg.temporal_args["num_heads"]

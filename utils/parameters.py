@@ -162,6 +162,23 @@ def get_parser():
         type=int,
         default=80,
         help='stop training in which epoch')
+
+    parser.add_argument(
+        '--num-warmup-epochs',
+        type=int,
+        default=None,
+        help='override the number of contrastive warmup epochs from the config')
+
+    parser.add_argument(
+        '--llm-precision',
+        default='fp32',
+        help='precision/quantization for the frozen LLM: fp32, bf16 or fp16')
+
+    parser.add_argument(
+        '--gradient-checkpointing',
+        type=str2bool,
+        default=False,
+        help='enable gradient checkpointing on the frozen LLM to save memory')
     return parser
 
 

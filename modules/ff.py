@@ -164,10 +164,11 @@ class IMTM_CMTM(nn.Module):
         """
 
         out = self.temporal_conv(frame_feat, lgt)
-        x = out["visual_feat"].permute(1, 0, 2).clone()
+        x = out["visual_feat"].permute(1, 0, 2).clone()  # (B, T, C)
         lgt = out["feat_len"]
 
-        x = self.pos_enc(x)
+        # PositionalEncoding expects (T, B, C); x is (B, T, C).
+        x = self.pos_enc(x.permute(1, 0, 2)).permute(1, 0, 2)
         mask = self.create_mask(lgt.tolist(), device=x.device)
         x = self.attn(x, key_padding_mask=~mask) + out["visual_feat"].permute(1, 0, 2)
 
