@@ -1,0 +1,364 @@
+# ViPo-SLT Sign-Language Translation - Session Report
+
+**Project:** ViPo-SLT - Gloss-free/gloss-assisted Sign Language Translation (SLT) on PHOENIX-2014T
+**Task:** German Sign Language (DGS) video → spoken German text (BLEU-4 / ROUGE-L)
+**Backbone:** `bigscience/mt0-xl` (3.78 B parameters, frozen) + LoRA adapters, fused with CLIP-ViT-L visual features and MAE motion features
+**Infrastructure:** single NVIDIA GPU, 15.57 GiB VRAM, `bf16` mixed precision
+**Reporting period:** 2026-09-27 to 2026-10-09
+**Report status:** final for this development session
+
+---
+
+## 1. Executive Summary
+
+This session took the ViPo-SLT system from producing **meaningless, near-perfect scores caused by data leakage** to a **correct, verified, reproducible translation model** that reaches **22.24 BLEU-4 / 0.449 ROUGE-L** on the PHOENIX-2014T test split.
+
+The single largest correctness fix was the removal of a prompt-construction bug that embedded the target German sentence (and translations of it) directly into the LLM input, allowing the model to copy the answer. After removing the leak, a genuine evaluation harness was established. Two effective levers were then identified empirically:
+
+1. **Model scale** - moving the frozen LLM from a smaller mT0 variant to `mt0-xl` (with bf16) raised the honest baseline from single digits to ~18 BLEU-4.
+2. **Gloss auxiliary supervision (CTC)** - restoring a dead CTC loss added **+4.28 BLEU-4**, the largest single improvement.
+
+A third hypothesised lever - **increasing LoRA adapter capacity** (rank 16 → 32, plus feed-forward modules) - was tested rigorously and **rejected**: it accelerated early convergence but *lowered* the final score, showing the system is **not limited by adapter capacity**. This is arguably the most valuable scientific finding of the session: the current ~22 BLEU ceiling is imposed by data / visual features / objective, not by LLM adaptation capacity.
+
+**Current best model:** `mt0-xl` (bf16) + CTC gloss loss + LoRA r16 → **dev BLEU-4 21.84 / test BLEU-4 22.24 / ROUGE-L 0.449**.
+**Deployment readiness:** **Not deployment-ready.** This is a research prototype; see Section 12.
+
+---
+
+## 2. Background and Objectives
+
+### 2.1 Task
+Continuous German Sign Language video is transcribed into spoken German text. The dataset is PHOENIX-2014T (weather-domain broadcast signing), a standard SLT benchmark with ~7k sentence pairs split into train/dev/test.
+
+### 2.2 Reference point
+The project targets a published result quoted internally as **~27.1 BLEU-4**. This number is **not directly comparable** to our metrics for three reasons that must be stated explicitly to any reviewer:
+- published numbers are often computed on an **English** target (via multi-reference MT), not on German;
+- visual front-ends and training data differ;
+- our German references include Google-Translate silver labels for auxiliary uses and the official German references for scoring.
+
+All comparisons in this report are **internal and like-for-like** (same data, same metric code, same splits).
+
+### 2.3 System architecture (as inherited and after our changes)
+- **Visual encoder:** CLIP-ViT-L/14 frame features (2048-d).
+- **Motion encoder:** MAE features (1024-d).
+- **Projections + fusion:** `sp_proj`, `mo_proj`, `fusion_proj`.
+- **Temporal encoder:** `IMTM_CMTM` (temporal convolution + positional encoding + 4-layer self-attention).
+- **Gloss head:** per-stream classifiers (`clf_sp`, `clf_mo`, `clf_pose`) → CTC auxiliary loss.
+- **Language model:** `mt0-xl`, frozen, adapted with LoRA; receives visual tokens + an instruction prompt and generates German text.
+- **Training objective:** contrastive (CLIP-style) vision–text alignment during warmup; then language-modelling cross-entropy + weighted CTC gloss loss.
+
+---
+
+## 3. Phase-by-Phase Work Log
+
+### Phase 0 - Diagnosis and repair of data leakage (critical)
+**Symptom.** The model reported implausibly high scores (near-perfect BLEU), inconsistent with a genuinely learned model.
+
+**Root cause.** In `dataset/loader_ft.py` and `models/edm_ddp.py`, the prompt received in-context examples of the form `f'{translation}={text}'`, where `text` was **the target sentence itself**. A helper `safe_derangement()` shuffled these examples across the batch, but the target sentence was still present verbatim in the encoder input (three times, in English/French/Spanish slots). The model copied the answer rather than translating the signs.
+
+**Fix (by construction, not by shuffling).**
+- `dataset/loader_ft.py`: the sample now returns only `english_text` (used solely as the contrastive target) and never exposes `text`/ICL to the model.
+- `models/edm_ddp.py`: prompt reduced to the **instruction only** - `prompts = [self.prompt for _ in range(bs)]`.
+- `utils/helpers.py`: `safe_derangement()` removed entirely.
+- `main.py`, `test.py`: variable `icl_text` renamed to `english_texts` throughout.
+
+**Verification.** A visual-ablation harness (`ablation_visual.py`) was written to test whether the encoder is actually used, by intervening on `_prepare_visual_input` in three modes:
+| Mode | Test BLEU-4 |
+|---|---|
+| `none` (real features) | 8.69 |
+| `zero` (zeroed features) | 0.81 |
+| `shuffle` (features permuted across the batch) | 5.34 |
+
+The strong degradation under zero/shuffle proves the model genuinely conditions on the visual content - the leakage is gone and the encoder is contributing.
+
+**Lesson.** When a model suddenly looks excellent, suspect leakage before celebrating. Remove leakage structurally; do not rely on shuffling/derangement, which does not remove the signal.
+
+---
+
+### Phase 1 - Memory enablement for large-model finetuning
+`mt0-xl` in fp32 requires ~15.1 GiB and **fails to load** on a 15.57 GiB GPU. We added a small, config-gated memory toolkit:
+- `utils/parameters.py`: new flags `--llm-precision {fp32,bf16,fp16}` (default fp32), `--gradient-checkpointing`, `--num-warmup-epochs`.
+- `models/edm_ddp.py`: `_prepare_llm` loads the backbone in the requested dtype (`torch_dtype`) and enables non-reentrant gradient checkpointing (`use_reentrant: False`, required for DDP); fused visual tokens are cast to the prompt dtype before concatenation.
+- Wired through `main.py`, `test.py`, `ablation_visual.py`.
+
+Result: `mt0-xl` in bf16 occupies ~7.4 GiB and trains on the available GPU.
+
+**Lesson.** A frozen backbone in reduced precision + LoRA + gradient checkpointing makes billion-parameter backbones trainable on commodity single-GPU hardware.
+
+---
+
+### Phase 2 - Warmup-length study (mT0-large era, exploratory)
+Ablation of the contrastive warmup length (the number of epochs during which the LLM is frozen and only vision–language alignment + gloss supervision train):
+
+| Warmup epochs | Test BLEU-4 | ROUGE-L |
+|---|---|---|
+| 10 | 8.83 | - |
+| 100 | 13.93 | 0.342 |
+
+**Lesson.** The vision→language alignment stage is essential; too little warmup leaves the LLM reading unaligned visual tokens. **But** length has strongly diminishing returns once alignment saturates (see Section 7 for the empirical loss curve).
+
+---
+
+### Phase 3 - Scale to mt0-xl (bf16)
+Config `baseline_edm_xl_bf16.yaml`: `mt0-xl`, bf16, gradient checkpointing, LoRA r16.
+
+**Result:** best dev BLEU-4 **17.15**, **test BLEU-4 17.96**, ROUGE-L 0.387.
+
+This established the honest, leak-free xl baseline.
+
+**Bottleneck and fix (test-time OOM).** Running the standalone test evaluation OOM'd because the checkpoint had been saved from GPU-resident tensors and generation allocated a large KV cache. Mitigations implemented:
+- `test.py`: load with `map_location="cpu"`, delete the raw state dict, and `torch.cuda.empty_cache()` before generation.
+- `main.py`: reload `best_model.pt` before the final test.
+- Operational workaround that reliably worked on the server: `--test-batch-size 1` and `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
+
+---
+
+### Phase 4 - Restore the dead CTC gloss auxiliary loss (largest lever)
+**Finding.** The CTC gloss loss was effectively **dead code**: it had no measurable effect because (a) targets were placed on CPU as `LongTensor` while logits were on GPU, (b) `zero_infinity=False` could produce inf/NaN on degenerate alignments, and (c) there was no filtering of invalid/empty gloss targets.
+
+**Fix (`models/edm_ddp.py`, `utils/parameters.py`).**
+- `CTCLoss(..., zero_infinity=True)`.
+- Targets moved to the correct device/dtype; correct length tensors.
+- Valid-index filtering; unknown/empty-gloss guard with a one-time warning if a batch yields no valid targets.
+- New `--ctc-weight` (default 1.0) scaling the auxiliary term.
+- Config `baseline_edm_xl_bf16_ctc.yaml` (`include_ctc: True`, warmup 50).
+
+**Result (run `p14t_ctc`):** best dev BLEU-4 **21.84** (epoch 93), **test BLEU-4 22.24**, ROUGE-L 0.449 - i.e. **+4.28 BLEU-4 over the no-CTC xl baseline**. Reproduced by the standalone `test.py`.
+
+Qualitative check on generated sentences: the model produces content-specific weather forecasts. Signed **numbers** are recalled with ~78% and **weekdays** ~81% token recall; ~43% of generations reach token-F1 ≥ 0.5, ~6% are exact matches.
+
+**Lesson.** An auxiliary loss that is silently zero is worse than no auxiliary loss, because it creates a false sense that it is "not helping". Validate that every loss term is genuinely active (non-zero, correct device/dtype).
+
+---
+
+### Phase 5 - LoRA-capacity hypothesis (tested and rejected)
+**Hypothesis.** The system is underfitting; broadening LoRA (literature suggests broadening module coverage beats raising rank) will increase the ceiling.
+
+**Implementation.**
+- `models/edm_ddp.py` `_apply_lora`: default mT5/T5 targets expanded from `["q","v"]` to **`["q","k","v","o","wi_0","wi_1","wo"]`** (full attention + gated FFN), config-overridable via `lora_targets`.
+- Config `baseline_edm_xl_bf16_ctc_lora32.yaml`: `lora_r: 32`, `lora_alpha: 64`, explicit targets. Trainable parameters rose from **38.72 M → 100.06 M**.
+- Added English logging (Option A, see Phase 6) for readability during development.
+
+**Result (`p14t_lora_r32`):** best dev BLEU-4 **20.43** (epoch 37), **early-stopped at epoch 47**, **test BLEU-4 21.51**, ROUGE-L 0.432.
+
+**Matched-epoch analysis (clean single-variable comparison, both warmup 50, both CTC):**
+
+| epoch | CTC r16 | LoRA r32+FFN | delta |
+|---|---|---|---|
+| 1 | 11.44 | 13.30 | +1.86 |
+| 5 | 15.76 | 17.55 | +1.79 |
+| 7 | 16.22 | 18.83 | +2.61 |
+| 10 | 16.91 | 19.46 | +2.55 |
+| 14 | 18.15 | 19.14 | +0.99 |
+| 18 | 19.25 | 19.97 | +0.72 |
+| 19 | 20.26 | 19.78 | -0.48 |
+| 21 | 20.63 | 19.65 | -0.98 |
+| 22 | 19.65 | 19.73 | +0.08 |
+
+**Verdict.** Extra capacity gave a large early lead (≈ +1.9 BLEU over epochs 1–10) that collapsed to ≈ 0 (and briefly went negative) by epoch ~20, and it converged to a **lower** final score (−0.73 test BLEU). The model is **not capacity-limited**; r16 is already sufficient.
+
+**Lesson.** Faster convergence is not the same as a higher ceiling. Scaling adapters on a frozen backbone can be neutral or harmful; capacity hypotheses must be validated at *matched epochs* and then at *convergence*, not from an early snapshot.
+
+---
+
+### Phase 6 - Readability tooling (English logging)
+To follow training despite German output, we added **Option A**: display an English rendering of both the generated and the reference German.
+- New `utils/translate_en.py`: tries Google (batch) first, then falls back to **MyMemory** (no API key), with results cached by source string (repeated early generations cost nothing). Fully defensive - failures are swallowed and logging degrades to German only.
+- `main.py` / `test.py`: per example, log `Generated`, `GeneratedEN`, `Reference`, `ReferenceEN`.
+- Google's free endpoint returned HTTP 429 on the server's datacenter IP from the very first request; the MyMemory fallback resolved this.
+
+**Lesson.** Development observability tooling should be robust to environment restrictions (rate limits, blocked endpoints) and must never crash the training job.
+
+---
+
+## 4. Repository Changes (what was added/modified and why)
+
+### Modified
+| File | Change | Why |
+|---|---|---|
+| `dataset/loader_ft.py` | Return only `english_text`; never expose `text`/ICL; conditional pose loading | Remove target leakage; avoid crash when `include_pose=False` and pose path absent |
+| `models/edm_ddp.py` | Instruction-only prompt; removed derangement; LoRA target expansion + `lora_targets` override + logging; `llm_precision` + gradient checkpointing; **CTC loss fix** (zero_infinity, device/dtype, valid filtering, guard); `ctc_weight`; token dtype cast | Correctness (leak, CTC), memory enablement, capacity experiment |
+| `modules/ff.py` | `PositionalEncoding` now applied on `(T,B,C)` instead of `(B,T,C)` | Off-by-axis bug: positional encoding was applied along the batch dimension |
+| `utils/helpers.py` | Removed `safe_derangement()` | Obsolete once leakage removed |
+| `utils/parameters.py` | Added `--num-warmup-epochs`, `--llm-precision`, `--gradient-checkpointing`, `--ctc-weight` | Expose memory/objective knobs from CLI |
+| `main.py` | Precision/checkpointing/CTC wiring; `icl_text`→`english_texts`; **held-out test evaluation**; best-checkpoint reload; English logging; `max(1, batch_size // world_size)` | Correctness + genuine test metric + observability |
+| `test.py` | `map_location="cpu"` load; `empty_cache()`; English logging | Fix test-time OOM; observability |
+
+### Added (untracked)
+| File | Purpose |
+|---|---|
+| `ablation_visual.py` | Visual-ablation harness (none/zero/shuffle) to prove the encoder is used |
+| `utils/translate_en.py` | German→English logging translator (Google→MyMemory, cached) |
+| `configs/baseline_edm_xl_bf16.yaml` | `mt0-xl` bf16 baseline (no CTC) |
+| `configs/baseline_edm_xl_bf16_ctc.yaml` | + CTC gloss loss (best model) |
+| `configs/baseline_edm_xl_bf16_ctc_lora32.yaml` | + LoRA r32/FFN (capacity experiment) |
+
+No files were deleted. `phoenix2014-T/` snapshots in the repo are stale and were intentionally not uploaded to the training server.
+
+---
+
+## 5. Configuration Summary
+
+| Config | LLM | Precision | CTC | LoRA r | LoRA α | Warmup | Batch |
+|---|---|---|---|---|---|---|---|
+| `baseline_edm.yaml` | mt0-xl | fp32 | off | 16 | 32 | 100 | 8 |
+| `baseline_edm_xl_bf16.yaml` | mt0-xl | bf16 | off | 16 | 32 | 100 | 8 |
+| `baseline_edm_xl_bf16_ctc.yaml` | mt0-xl | bf16 | **on (1.0)** | 16 | 32 | 50 | 8 |
+| `baseline_edm_xl_bf16_ctc_lora32.yaml` | mt0-xl | bf16 | on (1.0) | **32** | **64** | 50 | 8 |
+
+Common: `include_sp=True`, `include_mo=True`, `include_pose=False`, `model=models.edm_ddp.EDM`.
+
+---
+
+## 6. Consolidated Results
+
+All numbers are on the same PHOENIX-2014T splits using the in-repo `utils/evaluate.py`.
+
+| Run | Model | CTC | LoRA | Trainable | Best dev B4 | Test B4 | Test RG-L |
+|---|---|---|---|---|---|---|---|
+| Warmup study | mT0-large | off | 16 | - | - | 8.83 (w=10) | - |
+| Warmup study | mT0-large | off | 16 | - | - | 13.93 (w=100) | 0.342 |
+| `p14t_v5` | mt0-xl | off | 16 | 32.93 M | 17.15 | 17.96 | 0.387 |
+| `p14t_ctc` | mt0-xl | **on** | 16 | 38.72 M | **21.84** | **22.24** | **0.449** |
+| `p14t_lora_r32` | mt0-xl | on | **32+FFN** | 100.06 M | 20.43 | 21.51 | 0.432 |
+
+**Current best = `p14t_ctc`** (mt0-xl bf16 + CTC + LoRA r16).
+
+---
+
+## 7. Errors, Bottlenecks and Resolutions
+
+| # | Symptom / Error | Root cause | Resolution |
+|---|---|---|---|
+| 1 | Near-perfect BLEU (implausible) | Target sentence embedded in LLM prompt | Instruction-only prompt; remove ICL/derangement |
+| 2 | `CUDA out of memory` at model load | mt0-xl fp32 ≈15.1 GiB > 15.57 GiB usable | Load backbone in bf16 (~7.4 GiB) |
+| 3 | Test-time OOM (`Tried to allocate 2 MiB ... 3.25 MiB free`) | Checkpoint saved from GPU tensors + generation KV cache | `map_location="cpu"`; `empty_cache()`; best-ckpt reload; `--test-batch-size 1`; `expandable_segments:True` |
+| 4 | CTC had no effect | CPU `LongTensor` targets vs GPU logits; `zero_infinity=False`; no invalid filtering | Move targets to device/dtype; `zero_infinity=True`; filter invalid; guard + warning |
+| 5 | DDP incompatibility with gradient checkpointing | Reentrant checkpointing | `use_reentrant: False` |
+| 6 | Positional encoding applied along batch axis | `(B,T,C)` fed to encoder expecting `(T,B,C)` | Permute before/after `pos_enc` (`modules/ff.py`) |
+| 7 | Crash when pose absent | Unconditional pose init | Guard pose loading on `include_pose` |
+| 8 | `ModuleNotFoundError: utils.translate_en` | New file not uploaded to server | Upload the new module |
+| 9 | Google Translate `TooManyRequests` (429) on first call | Datacenter IP throttled by Google | MyMemory fallback backend + cache |
+| 10 | `AttributeError: 'str' object has no attribute 'get'` in ad-hoc diagnostic | Annotation dict has non-int keys (e.g. `'prefix'`) | Iterate only dict-valued entries / filter keys |
+| 11 | `find_unused_parameters=True` / `mt5→t5` / truncation warnings | Framework advisories | Harmless; left as-is |
+| 12 | Large-epoch-count confusion during smoke tests | Smoke test used `--num-warmup-epochs 0`, producing degenerate output and loss 92 | Not a bug: with warmup the LLM reads unaligned tokens; full configs use warmup 50 |
+
+---
+
+## 8. Resources and Compute
+
+- **Hardware:** one NVIDIA GPU, **15.57 GiB** VRAM.
+- **Model:** mt0-xl = **3,842.68 M** total parameters; trainable 32.93 M (r16, no CTC) / 38.72 M (r16 + CTC) / 100.06 M (r32 + FFN).
+- **Timing:**
+ - Warmup epoch (frozen LLM, contrastive only): **~0.86–1.01 min**.
+ - LM epoch (xl, with CTC): **~14.4–15.4 min**.
+ - LM epoch (xl, no CTC): **~11 min**.
+- **Wall-clock estimates per run (approximate):**
+ - `p14t_lora_r32`: 50 warmup (~0.8 h) + 47 LM epochs (~11.6 h) ≈ **~12.4 h**.
+ - `p14t_ctc`: 50 warmup + ~93–103 LM epochs ≈ **~24–26 h**.
+ - `p14t_v5`: ~142 epochs at ~11 min ≈ **~26 h** (excluding warmup).
+- Overall compute is dominated by the LM-training epochs; warmup is comparatively cheap.
+
+---
+
+## 9. Lessons Learned
+
+### 9.1 Machine-learning methodology
+1. **Never trust spectacular metrics.** Data leakage is the first hypothesis; remove it structurally.
+2. **Ablate features to prove the model uses them.** The none/zero/shuffle ablation is a cheap, decisive test.
+3. **Validate every loss term actually fires.** Silent dead code (CTC) misled us for a whole phase.
+4. **Capacity is not always the bottleneck.** 2.6× more trainable parameters improved convergence speed but lowered the final score - the ceiling is data-/feature-bound.
+5. **Compare at matched epochs and at convergence.** An epoch-6 snapshot suggested a gain that vanished by convergence.
+6. **Scale helps up to a point.** mt0-large → mt0-xl raised the honest baseline substantially; beyond that, capacity saturation.
+7. **Auxiliary supervision works.** Gloss-level CTC added +4.28 BLEU, the largest single lever.
+8. **Alignment warmup is essential but saturates.** Its loss flattens well before 100 epochs; excessive warmup is wasted compute.
+9. **Low precision + checkpointing + LoRA** enable billion-parameter finetuning on a single modest GPU.
+10. **Metric hygiene matters.** `use_stemmer=True` over-stems German; ROUGE-L is therefore not comparable to published English-target numbers.
+
+### 9.2 Sign-language recognition (SLR/SLT) specifics
+1. **Gloss supervision bridges continuous signing and translation** - explicitly modelling glosses as an auxiliary task is highly effective.
+2. **External multilingual LMs transfer** to domain-specific German weather captions, reducing the data requirement.
+3. **Genuine grounding is observable** - correct recall of signed numbers (~78%) and weekdays (~81%) indicates real sign understanding rather than language priors.
+4. **Dataset scale/style is a hard ceiling.** PHOENIX-2014T is small and formulaic; ~22 BLEU is consistent with the literature range for this setup and is *not* comparable to larger or English-target benchmarks.
+5. **Report comparability explicitly.** Target language, feature extractor, and reference provenance change the meaning of BLEU.
+
+---
+
+## 10. Where We Stand (Verdict)
+
+- **Correct, leakage-free, reproducible pipeline** with a held-out test set and a standalone test script.
+- **Best model:** mt0-xl (bf16) + CTC gloss loss + LoRA r16 → **dev 21.84 / test 22.24 BLEU-4 / ROUGE-L 0.449**.
+- **Ceiling is not adapter capacity**; it is set by visual features / data / objective.
+- **Output quality:** content-specific and domain-plausible; ~43% of sentences at token-F1 ≥ 0.5, ~6% exact - i.e. useful partial translations, not yet fully reliable ones.
+
+---
+
+## 11. Next Steps and Recommendations
+
+**Priority 0 - consolidate**
+1. Lock `baseline_edm_xl_bf16_ctc.yaml` (r16) as the reference configuration; retire the r32 variant.
+2. Commit the current code, configs, and this report to version control.
+
+**Priority 1 - attack the real bottleneck (visual representation)**
+3. Evaluate stronger visual front-ends (video- or sign-specific encoders, fine-tuned features) and richer temporal modelling. This is the highest-value bet given the capacity result.
+
+**Priority 2 - objective and decoding**
+4. Tune the gloss-supervision strength (`--ctc-weight`) and consider deeper gloss coupling.
+5. Decoding sweep: beam size, length penalty, no-repeat constraints.
+6. Error analysis by phenomenon (numbers, negation, named entities).
+
+**Priority 3 - modality and comparability**
+7. Test the (currently disabled) pose modality.
+8. Run an **English-target** experiment for direct comparability with published numbers (noting the silver-MT reference caveat).
+
+**Priority 4 - efficiency / deployment research**
+9. Inference latency and throughput benchmarking; distillation/quantisation of the 3.78 B model.
+
+---
+
+## 12. Deployment Readiness
+
+**Assessment: NOT deployment-ready.** This is a research prototype. Gaps:
+- **Accuracy:** ~22 BLEU-4 with ~6% exact matches is insufficient for unsupervised use; a human-in-the-loop or assistive framing would be required.
+- **Model size/latency:** a 3.78 B-parameter backbone is far too large for on-device/edge use; no latency or real-time constraint has been tested.
+- **Robustness:** no evaluation across signers, lighting, camera angles, or regional variation; no demographic/ethics review.
+- **No streaming** capability (single-sentence clip input only).
+- **Deaf-community involvement and consent** must be part of any productisation.
+
+**Minimum bar before piloting:** improved accuracy (target ≫22 BLEU-4 or task-specific acceptance metrics), a small distilled/app-ready model, latency benchmarking, and a domain-expert evaluation with representative users.
+
+---
+
+## 13. Reproducibility
+
+Best (CTC, r16) run:
+```bash
+python main.py --config ./configs/baseline_edm_xl_bf16_ctc.yaml --work-dir ./work_dir/p14t_ctc
+```
+Standalone evaluation (single process, batch 1):
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python test.py \
+  --work-dir ./work_dir/p14t_ctc \
+  --config ./configs/baseline_edm_xl_bf16_ctc.yaml \
+  --test-batch-size 1
+```
+Visual ablation:
+```bash
+python ablation_visual.py --config ./configs/baseline_edm_xl_bf16_ctc.yaml --work-dir ./work_dir/p14t_ctc
+```
+
+---
+
+## 14. Appendix - File Inventory (relative to repository root)
+
+**Modified**
+- `dataset/loader_ft.py`, `models/edm_ddp.py`, `modules/ff.py`, `utils/helpers.py`, `utils/parameters.py`, `main.py`, `test.py`
+
+**Added**
+- `ablation_visual.py`
+- `utils/translate_en.py`
+- `configs/baseline_edm_xl_bf16.yaml`
+- `configs/baseline_edm_xl_bf16_ctc.yaml`
+- `configs/baseline_edm_xl_bf16_ctc_lora32.yaml`
+
+**Work directories referenced** (excluded from version control): `work_dir/p14t_v5`, `work_dir/p14t_ctc`, `work_dir/p14t_lora_r32`.
